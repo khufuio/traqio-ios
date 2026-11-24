@@ -51,6 +51,58 @@ Traqio.setUserId(user.id)   // the same id you give RevenueCat (app_user_id)
 Traqio.track("purchase", value: 9.99, currency: "EUR")   // also moves the SKAN conversion value
 ```
 
+## Product analytics
+
+`capture` records a product-analytics event and `screen` a screen view — what the
+console's Analytics section reads (events, top screens, funnels, a split by property).
+Neither is a conversion: they go to `/ingest/analytics`, are never billed and never
+reach an ad network. A purchase or a sign-up stays `track`.
+
+```swift
+Traqio.capture("deck_built", properties: ["cards": 40, "format": "standard"])
+
+// When a screen appears — viewDidAppear, or SwiftUI's .onAppear
+Traqio.screen("Paywall", properties: ["variant": "b"])
+
+// The user's properties: a breakdown, a report dimension, a cohort condition
+Traqio.identify(user.id, traits: ["plan": "pro", "seats": 12], traitsOnce: ["signup_platform": "ios"])
+
+// Super-properties: added to every analytics event from now on (kept across launches)
+Traqio.register(["app_flavor": "beta"])
+Traqio.unregister("app_flavor")
+```
+
+Batched (up to 50 per request), flushed when the app goes to the background, kept on
+the device while offline and retried with back-off; a call never throws. Calls made
+before `start` wait for it. Properties must survive JSON and stay under 4 KB, else they
+are dropped and the event kept; names starting with `$` are reserved. The same screen
+twice in a row counts once, and later events carry the screen in view. A session ends
+after 30 idle minutes. Trait values are text, numbers or booleans — never an email or
+a name. Debug builds land in Analytics › Realtime › Debug and are counted nowhere.
+
+## Groups (B2B accounts)
+
+If your users work inside accounts — a company, a workspace, a team — call `group`
+after sign-in with the account's type and **your own account id**. Every analytics
+event that follows counts for that account, so the console's Analytics can count
+accounts instead of people: unique accounts, funnels and retention by account, and the
+list of accounts with their properties.
+
+```swift
+Traqio.group("company", key: account.id, traits: ["plan": "pro", "seats": 12])
+
+// On sign-out
+Traqio.resetGroups()
+```
+
+The type is lowercase (`company`, `workspace`, `team`), five types at most; the key is
+your account id, 256 characters at most — never an email. Traits describe the account
+(a plan, a seat count) under the same rules as `identify` — never an email or a
+person's name. Groups are kept across launches and attached to every analytics event
+queued afterwards (never to `identify`); a call with the same key and no traits sends
+nothing, so calling it at every launch is fine. Call `resetGroups()` on sign-out;
+`getGroups()` returns the groups held.
+
 ## Advertising id (opt-in)
 
 Off by default — the SDK reads no IDFA unless you turn it on, and **never shows the

@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'TraqioSDK'
-  s.version          = '0.1.0'
+  s.version          = '0.2.0'
   s.summary          = 'Traqio iOS SDK — mobile attribution + ROAS (SKAN + Apple Ads).'
   s.homepage         = 'https://traqio.app/docs/sdks/ios'
   s.license          = { :type => 'MIT', :file => 'LICENSE' }

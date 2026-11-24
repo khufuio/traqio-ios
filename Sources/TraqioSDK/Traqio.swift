@@ -31,7 +31,14 @@ public enum Traqio {
   // Ad impressions: their own queue, the batch id persisted beside it so a retry
   // after a crash reuses it and the server dedups instead of double-counting.
   private static let adQueueKey = "traq_ad_queue"
-  private static let sdkVersion = "0.1.0"
+  // Product analytics (`capture()` / `screen()`): their own queue, their own route.
+  private static let analyticsQueueKey = "traq_analytics_queue"
+  private static let analyticsSessionKey = "traq_analytics_session"
+  /// `register()`'s super-properties, kept across launches.
+  private static let superPropsKey = "traq_super_props"
+  /// `group()`'s groups (B2B accounts), kept across launches beside the super-properties.
+  private static let groupsKey = "traq_groups"
+  private static let sdkVersion = "0.2.0"
   private static let maxBatch = 20
   private static let maxQueue = 500
   private static let baseRetry: TimeInterval = 1
@@ -59,6 +66,8 @@ public enum Traqio {
   private static var testAds = false
   /// Once `adRevenue` captures a network, its manual calls are ignored (HQ cmwfq3ij).
   static let adGate = TraqioAdRevenueGate()
+  /// Session, screen in view and super-properties — read from storage on first use.
+  private static var analyticsState: TraqioAnalyticsState?
 
   /// Whether this install's traffic is flagged as debug — shown in the console's
   /// Debug view, never counted, attributed, forwarded to ad networks or billed.
@@ -116,7 +125,8 @@ public enum Traqio {
       started = true
       self.sdkKey = sdkKey
       self.endpoint = endpoint.hasSuffix("/") ? String(endpoint.dropLast()) : endpoint
-      self.userId = userId
+      // An `identify()` made before `start` is kept when `start` names nobody.
+      if let userId = userId { self.userId = userId }
       self.deepLinking = deepLinking
       self.collectAdvertisingId = collectAdvertisingId
       self.debug = debug ?? detectDebug()
@@ -146,7 +156,7 @@ public enum Traqio {
       // of a day is the one the whole retention number rests on.
       startSession(force: true)
       wireLifecycle()
-      if !loadQueue().isEmpty || !loadAdItems().isEmpty { scheduleFlush(0) }
+      if !loadQueue().isEmpty || !loadAdItems().isEmpty || !loadAnalyticsQueue().isEmpty { scheduleFlush(0) }
     }
   }
 
@@ -293,6 +303,131 @@ public enum Traqio {
     }
   }
 
+  // ── product analytics (HQ cmwux580) ────────────────────
+
+  /// A product-analytics event — `paywall_viewed`, `deck_built`, `search_performed`…
+  /// — read in the console's Analytics section (events, funnels, property splits).
+  /// NOT a conversion: never billed, never sent to an ad network (that is `track`).
+  ///
+  ///   Traqio.capture("lead_captured", properties: ["magnet": "starter-deck"])
+  ///
+  /// Batched, persisted while offline and retried; it never throws. Names starting
+  /// with `$` are reserved; properties must survive JSON and stay under 4 KB, else
+  /// they are dropped (the event is kept). Callable before `start`: the events wait
+  /// in storage and leave once it ran.
+  public static func capture(_ name: String, properties: [String: Any]? = nil) {
+    let now = nowMs()
+    q.async {
+      var state = loadAnalyticsState()
+      guard let e = state.capture(name, props: properties, now: now, newId: { UUID().uuidString }) else { return }
+      analyticsState = state
+      queueAnalytics(e)
+    }
+  }
+
+  /// A screen view — the app's page view, read under « Top pages » and usable as a
+  /// funnel step. Call it when a screen appears (`viewDidAppear`, SwiftUI `.onAppear`).
+  /// The same screen reported twice in a row inside a session counts once, and
+  /// custom events captured afterwards carry this screen as their page.
+  ///
+  ///   Traqio.screen("Paywall", properties: ["variant": "b"])
+  public static func screen(_ name: String, properties: [String: Any]? = nil) {
+    let now = nowMs()
+    q.async {
+      var state = loadAnalyticsState()
+      guard let e = state.screen(name, props: properties, now: now, newId: { UUID().uuidString }) else { return }
+      analyticsState = state
+      queueAnalytics(e)
+    }
+  }
+
+  /// Who the user is, and what they are: sets the user id (like `setUserId`) and, with
+  /// traits, the user's PROPERTIES — `plan`, `role`, `company_size` — read in the
+  /// console as a breakdown, a report dimension and a cohort condition.
+  ///
+  ///   Traqio.identify("u_123", traits: ["plan": "pro", "seats": 12], traitsOnce: ["signup_platform": "ios"])
+  ///
+  /// `traits` overwrite what was set before; `traitsOnce` are written only where the
+  /// user has no value yet. Values are text, numbers or booleans — never an email or
+  /// a name. At most 50 keys.
+  public static func identify(_ userId: String, traits: [String: Any]? = nil, traitsOnce: [String: Any]? = nil) {
+    let id = userId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if id.isEmpty { return }
+    let now = nowMs()
+    q.async {
+      self.userId = id
+      guard let e = loadAnalyticsState().identify(userId: id, traits: traits, traitsOnce: traitsOnce, now: now) else { return }
+      queueAnalytics(e)
+    }
+  }
+
+  /// Super-properties: added to EVERY analytics event from now on (and across
+  /// launches) — a flavour, an A/B arm, a theme. An event's own property of the same
+  /// name wins. Text, numbers or booleans, at most 50.
+  ///
+  ///   Traqio.register(["app_flavor": "beta", "theme": "dark"])
+  public static func register(_ properties: [String: Any]) {
+    q.async {
+      var state = loadAnalyticsState()
+      state.register(properties)
+      analyticsState = state
+      persistSuperProps(state.superProps)
+    }
+  }
+
+  /// Stop adding one super-property to the events.
+  public static func unregister(_ key: String) {
+    q.async {
+      var state = loadAnalyticsState()
+      guard state.superProps[key] != nil else { return }
+      state.unregister(key)
+      analyticsState = state
+      persistSuperProps(state.superProps)
+    }
+  }
+
+  /// The super-properties `register` set.
+  public static func getSuperProperties() -> [String: Any] {
+    q.sync { loadAnalyticsState().superProps }
+  }
+
+  /// Groups (B2B accounts): the user belongs to this account from now on (and across
+  /// launches) — every following analytics event counts for it, so the console's
+  /// Analytics can count accounts (funnels, retention, unique accounts).
+  ///
+  ///   Traqio.group("company", key: account.id, traits: ["plan": "pro", "seats": 12])
+  ///
+  /// `groupType` is lowercase (`company`, `workspace`, `team`); `key` is YOUR account
+  /// id — never an email. `traits` are the account's properties, under identify's
+  /// rules: never a person's name or email. At most 5 group types; a call with the
+  /// same key and no traits sends nothing, so calling it at every launch is fine.
+  public static func group(_ groupType: String, key: String, traits: [String: Any]? = nil) {
+    let now = nowMs()
+    q.async {
+      var state = loadAnalyticsState()
+      let before = state.groups
+      let entry = state.group(type: groupType, key: key, traits: traits, now: now)
+      analyticsState = state
+      if state.groups != before { persistGroups(state.groups) }
+      if let entry = entry { queueAnalytics(entry) }
+    }
+  }
+
+  /// Leaves every group — call it on sign-out.
+  public static func resetGroups() {
+    q.async {
+      var state = loadAnalyticsState()
+      state.resetGroups()
+      analyticsState = state
+      persistGroups(state.groups)
+    }
+  }
+
+  /// The groups `group` set (type → key).
+  public static func getGroups() -> [String: String] {
+    q.sync { loadAnalyticsState().groups }
+  }
+
   // ── ad revenue (HQ cmwfo9pd) ───────────────────────────
 
   /// Report one AdMob impression by hand, from your own paid event handler. With
@@ -379,7 +514,8 @@ public enum Traqio {
   /// Called on q with `flushing` already set; clears it when done.
   private static func flushAds() {
     let items = loadAdItems()
-    if items.isEmpty { flushing = false; return }
+    // Then analytics: neither queue ever holds an event back.
+    if items.isEmpty { flushAnalytics(); return }
     let sources = items.map { $0["source"] as? String ?? TraqioAdRevenueRules.sourceAdMob }
     let count = TraqioAdRevenueRules.nextBatchSize(sources: sources)
     let impressions: [[String: Any]] = items.prefix(count).map { var i = $0; i["source"] = nil; return i }
@@ -413,6 +549,94 @@ public enum Traqio {
   }
 
   // ── internals (all on q) ───────────────────────────────
+  private static func nowMs() -> Int64 { Int64((Date().timeIntervalSince1970 * 1000).rounded()) }
+
+  private static func loadAnalyticsState() -> TraqioAnalyticsState {
+    if let state = analyticsState { return state }
+    var state = TraqioAnalyticsState()
+    let defaults = UserDefaults.standard
+    // A session left less than 30 minutes ago goes on: an app switch is not a new visit.
+    if let data = defaults.data(forKey: analyticsSessionKey) {
+      state.session = TraqioAnalyticsSession(json: try? JSONSerialization.jsonObject(with: data))
+    }
+    if let data = defaults.data(forKey: superPropsKey) {
+      state.superProps = TraqioAnalyticsRules.cleanTraits(try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+    if let data = defaults.data(forKey: groupsKey) {
+      state.groups = TraqioAnalyticsRules.cleanGroups(try? JSONSerialization.jsonObject(with: data))
+    }
+    analyticsState = state
+    return state
+  }
+
+  private static func persistGroups(_ groups: [String: String]) {
+    if groups.isEmpty {
+      UserDefaults.standard.removeObject(forKey: groupsKey)
+    } else if let data = try? JSONSerialization.data(withJSONObject: groups) {
+      UserDefaults.standard.set(data, forKey: groupsKey)
+    }
+  }
+
+  private static func persistSuperProps(_ props: [String: Any]) {
+    if let data = try? JSONSerialization.data(withJSONObject: props) {
+      UserDefaults.standard.set(data, forKey: superPropsKey)
+    }
+  }
+
+  private static func queueAnalytics(_ event: [String: Any]) {
+    var arr = loadAnalyticsQueue()
+    arr.append(event)
+    if arr.count > TraqioAnalyticsRules.maxQueue { arr.removeFirst(arr.count - TraqioAnalyticsRules.maxQueue) }
+    saveAnalyticsQueue(arr)
+    if let session = analyticsState?.session, let data = try? JSONSerialization.data(withJSONObject: session.json) {
+      UserDefaults.standard.set(data, forKey: analyticsSessionKey)
+    }
+    // Before `start` there is no key to send with: `start` flushes what waited.
+    if started { scheduleFlush() }
+  }
+
+  private static func loadAnalyticsQueue() -> [[String: Any]] {
+    guard let data = UserDefaults.standard.data(forKey: analyticsQueueKey),
+          let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+    return arr
+  }
+
+  private static func saveAnalyticsQueue(_ arr: [[String: Any]]) {
+    if let data = try? JSONSerialization.data(withJSONObject: arr) {
+      UserDefaults.standard.set(data, forKey: analyticsQueueKey)
+    }
+  }
+
+  /// Sends the analytics queue, 50 at a time, after events and ad impressions.
+  /// Called on q with `flushing` already set; clears it when done.
+  private static func flushAnalytics() {
+    let items = loadAnalyticsQueue()
+    if items.isEmpty { flushing = false; return }
+    let batch = Array(items.prefix(TraqioAnalyticsRules.maxBatch))
+    // `anonymousId` is the device id the install carries, so a visitor in the
+    // Analytics page is a device in the attribution reports.
+    let body = TraqioAnalyticsRules.body(sdkKey: sdkKey, anonymousId: deviceId(), userId: userId, events: batch)
+    send(body, path: TraqioAnalyticsRules.path, consent: false) { status in
+      q.async {
+        let outcome = TraqioAnalyticsRules.outcome(status: status)
+        if outcome == .retry {
+          flushing = false
+          retry = min(retry * 2, maxRetry)
+          scheduleFlush(retry)
+          return
+        }
+        if outcome == .refused {
+          NSLog("[traqio] the server refused %d analytics event(s) as malformed — dropped, not retried", batch.count)
+        }
+        var current = loadAnalyticsQueue()
+        current.removeFirst(min(batch.count, current.count))
+        saveAnalyticsQueue(current)
+        retry = baseRetry
+        flushAnalytics()
+      }
+    }
+  }
+
   private static func storeConsent(_ granted: Bool) {
     UserDefaults.standard.set(granted ? "granted" : "denied", forKey: consentKey)
   }
@@ -535,8 +759,8 @@ public enum Traqio {
     if flushing { return }
     let arr = loadQueue()
     if arr.isEmpty {
-      // Events first, then ad impressions: the ad queue never holds an event back.
-      if !loadAdItems().isEmpty { flushing = true; flushAds() }
+      // Events first, then ad impressions, then analytics: neither holds an event back.
+      if !loadAdItems().isEmpty || !loadAnalyticsQueue().isEmpty { flushing = true; flushAds() }
       return
     }
     flushing = true
@@ -558,13 +782,20 @@ public enum Traqio {
         current.removeFirst(min(batch.count, current.count))
         saveQueue(current)
         retry = baseRetry
-        if !current.isEmpty || !loadAdItems().isEmpty { scheduleFlush(0) }
+        if !current.isEmpty || !loadAdItems().isEmpty || !loadAnalyticsQueue().isEmpty { scheduleFlush(0) }
       }
     }
   }
 
   private static func post(
     _ body: [String: Any], path: String = "/ingest", consent withConsent: Bool = true, done: @escaping (Bool) -> Void
+  ) {
+    send(body, path: path, consent: withConsent) { status in done(status.map { (200..<300).contains($0) } ?? false) }
+  }
+
+  /// `post`, answering the HTTP status (nil = no answer: network down, bad body).
+  private static func send(
+    _ body: [String: Any], path: String, consent withConsent: Bool, done: @escaping (Int?) -> Void
   ) {
     var body = body
     // Read at SEND time, not enqueue time: a batch queued before the user said no
@@ -577,14 +808,13 @@ public enum Traqio {
     // Omitted in production, so a release body stays the same as before.
     if debug { body["debug"] = true }
     guard let url = URL(string: "\(endpoint)\(path)"),
-          let data = try? JSONSerialization.data(withJSONObject: body) else { done(false); return }
+          let data = try? JSONSerialization.data(withJSONObject: body) else { done(nil); return }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = data
     URLSession.shared.dataTask(with: req) { _, response, _ in
-      let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
-      done(ok)
+      done((response as? HTTPURLResponse)?.statusCode)
     }.resume()
   }
 }
