@@ -103,6 +103,27 @@ queued afterwards (never to `identify`); a call with the same key and no traits 
 nothing, so calling it at every launch is fine. Call `resetGroups()` on sign-out;
 `getGroups()` returns the groups held.
 
+## Alias, sign-out and experiments
+
+```swift
+// At sign-up: the guest id you used so far is this user.
+Traqio.identify(user.id)
+Traqio.alias(guestId)
+
+// On sign-out
+Traqio.reset()
+
+// Where the user first meets an experiment's variant
+Traqio.exposure("paywall_copy", variant: "b")
+```
+
+`alias` merges what this device sent under the previous id (1–256 characters) into the
+current user; it needs a current user id and is ignored for the same id. `reset` forgets
+the user id, the super-properties, the groups and the screen in view, and starts a new
+session — the device id, consent and pending events are kept, and events queued before
+it still count for the signed-out user. `exposure` sends `$exposure` with `experiment` and
+`variant` (1–200 characters each), what the console's experiment analysis reads.
+
 ## Advertising id (opt-in)
 
 Off by default — the SDK reads no IDFA unless you turn it on, and **never shows the

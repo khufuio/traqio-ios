@@ -221,4 +221,116 @@ final class AnalyticsTests: XCTestCase {
     XCTAssertTrue(s.groups.isEmpty)
     XCTAssertNil(s.capture("b", props: nil, now: 7, newId: next)!["groups"])
   }
+
+  // ── alias / reset / exposure (HQ cmwv9c16) ──
+
+  func testUserIdsAreCleaned() {
+    XCTAssertEqual(R.cleanUserId(" g_1 "), "g_1")
+    XCTAssertNil(R.cleanUserId("  "))
+    XCTAssertNil(R.cleanUserId(String(repeating: "x", count: 257)))
+    XCTAssertEqual(R.cleanUserId(String(repeating: "x", count: 256))?.count, 256)
+  }
+
+  func testAliasIsOneEntryForTheCurrentUserAndNotActivity() {
+    var s = TraqioAnalyticsState()
+    XCTAssertNil(s.alias(userId: nil, previousId: "guest_1", now: 1), "no current user: ignored")
+    XCTAssertNil(s.alias(userId: "u_1", previousId: "u_1", now: 1), "the same id: ignored")
+    XCTAssertNil(s.alias(userId: "u_1", previousId: " u_1 ", now: 1))
+    XCTAssertNil(s.alias(userId: "u_1", previousId: "", now: 1))
+    XCTAssertNil(s.alias(userId: "u_1", previousId: String(repeating: "x", count: 257), now: 1))
+    s.register(["plan": "pro"])
+    _ = s.group(type: "company", key: "acme", traits: nil, now: 1)
+    let a = s.alias(userId: "u_1", previousId: " guest_1 ", now: 2)!
+    XCTAssertEqual(json(a), #"{"kind":"alias","previousId":"guest_1","sessionId":"","ts":2,"userId":"u_1"}"#)
+    XCTAssertNil(s.session, "an alias is not activity")
+    _ = s.capture("a", props: nil, now: 3, newId: ids())
+    XCTAssertEqual(s.alias(userId: "u_1", previousId: "g", now: 4)?["sessionId"] as? String, "s1")
+  }
+
+  func testResetClearsSuperPropsGroupsScreenAndEndsTheSession() {
+    var s = TraqioAnalyticsState()
+    let next = ids()
+    s.register(["plan": "pro"])
+    _ = s.group(type: "company", key: "acme", traits: nil, now: 1)
+    _ = s.screen("Home", props: nil, now: 1, newId: next)
+    XCTAssertEqual(s.session?.id, "s1")
+    s.reset()
+    XCTAssertNil(s.session)
+    XCTAssertNil(s.currentScreen)
+    XCTAssertTrue(s.superProps.isEmpty)
+    XCTAssertTrue(s.groups.isEmpty)
+    // A minute later, still inside the old visit's window: a NEW session, nothing of the old user.
+    let e = s.capture("after", props: nil, now: 60_000, newId: next)!
+    XCTAssertEqual(json(e), #"{"kind":"custom","name":"after","sessionId":"s2","ts":60000}"#)
+  }
+
+  func testResetStampsQueuedRowsNotEntriesNorStampedOnes() {
+    let q: [[String: Any]] = [
+      ["kind": "custom", "name": "a"],
+      ["kind": "identify", "userId": "u_1"],
+      ["kind": "group", "groupType": "company", "groupKey": "acme"],
+      ["kind": "alias", "userId": "u_1", "previousId": "g"],
+      ["kind": "pageview", "screen": "Home", "asUser": "u_0"],
+    ]
+    let stamped = R.stampedForReset(q, userId: "u_1")
+    XCTAssertEqual(stamped.map { $0["asUser"] as? String }, ["u_1", nil, nil, nil, "u_0"])
+    // No user signed in: nothing to stamp.
+    XCTAssertNil(R.stampedForReset(q, userId: nil)[0]["asUser"])
+    // Stamps survive the queue's JSON round trip (a relaunch).
+    let data = try! JSONSerialization.data(withJSONObject: stamped)
+    let back = try! JSONSerialization.jsonObject(with: data) as! [[String: Any]]
+    XCTAssertEqual(back[0]["asUser"] as? String, "u_1")
+  }
+
+  func testOneUserPerBatchAndTheStampNeverTravels() {
+    let ev: (String, String?) -> [String: Any] = { name, asUser in
+      var e: [String: Any] = ["kind": "custom", "name": name, "ts": 1, "sessionId": "s"]
+      if let asUser = asUser { e["asUser"] = asUser }
+      return e
+    }
+    let q: [[String: Any]] = [ev("a", "u_1"), ["kind": "alias", "ts": 1, "sessionId": "", "userId": "u_1", "previousId": "g"], ev("b", "u_1"), ev("c", nil), ev("d", nil)]
+    let first = R.nextBatch(q, current: nil, max: 50)
+    XCTAssertEqual(first.userId, "u_1")
+    XCTAssertEqual(first.taken, 3)
+    XCTAssertFalse(first.events.contains { $0["asUser"] != nil })
+    let second = R.nextBatch(Array(q.dropFirst(3)), current: "u_2", max: 50)
+    XCTAssertEqual(second.userId, "u_2")
+    XCTAssertEqual(second.taken, 2)
+    XCTAssertEqual(R.nextBatch(q, current: nil, max: 2).taken, 2)
+    // Only entries: the current user.
+    let entries = R.nextBatch([q[1]], current: "u_9", max: 50)
+    XCTAssertEqual(entries.userId, "u_9")
+    XCTAssertEqual(entries.taken, 1)
+    // Captured under u_1 before a reset, flushed with nobody signed in: still u_1, never none.
+    let signedOut = R.nextBatch([ev("x", "u_1"), ev("y", nil)], current: nil, max: 50)
+    XCTAssertEqual(signedOut.userId, "u_1")
+    XCTAssertEqual(signedOut.taken, 1)
+    // The wire body leaves userId out when the batch has none.
+    XCTAssertNil(R.body(sdkKey: "k", anonymousId: "d", userId: R.nextBatch([ev("y", nil)], current: nil, max: 50).userId, events: [])["userId"])
+  }
+
+  func testExposurePropsOverrideAndAreValidated() {
+    let p = R.exposureProps(experiment: " paywall ", variant: " b ", props: ["experiment": "spoofed", "screen": "home"])!
+    XCTAssertEqual(json(p), #"{"experiment":"paywall","screen":"home","variant":"b"}"#)
+    XCTAssertEqual(json(R.exposureProps(experiment: "e", variant: "true", props: nil)!), #"{"experiment":"e","variant":"true"}"#)
+    XCTAssertNil(R.exposureProps(experiment: "", variant: "b", props: nil))
+    XCTAssertNil(R.exposureProps(experiment: "e", variant: "  ", props: nil))
+    XCTAssertNil(R.exposureProps(experiment: "e", variant: String(repeating: "x", count: 201), props: nil))
+    XCTAssertNil(R.exposureProps(experiment: String(repeating: "x", count: 201), variant: "b", props: nil))
+    XCTAssertNotNil(R.exposureProps(experiment: String(repeating: "x", count: 200), variant: "b", props: nil))
+    // `$exposure` is the one reserved name capture() takes, so the event goes out as a custom row.
+    var s = TraqioAnalyticsState()
+    let e = s.capture("$exposure", props: p, now: 1, newId: ids())!
+    XCTAssertEqual(json(e), #"{"kind":"custom","name":"$exposure","props":{"experiment":"paywall","screen":"home","variant":"b"},"sessionId":"s1","ts":1}"#)
+  }
+
+  func testExposureOverThePropsCapKeepsExperimentAndVariant() {
+    let big = R.exposureProps(experiment: "paywall", variant: "b", props: ["blob": String(repeating: "x", count: 5000)])!
+    XCTAssertEqual(json(big), #"{"experiment":"paywall","variant":"b"}"#)
+    let notJson = R.exposureProps(experiment: "paywall", variant: "b", props: ["at": Date()])!
+    XCTAssertEqual(json(notJson), #"{"experiment":"paywall","variant":"b"}"#)
+    var s = TraqioAnalyticsState()
+    let e = s.capture("$exposure", props: big, now: 1, newId: ids())!
+    XCTAssertEqual(json(e["props"]!), #"{"experiment":"paywall","variant":"b"}"#)
+  }
 }

@@ -157,6 +157,85 @@ enum TraqioAnalyticsRules {
     return out
   }
 
+  // ── alias / reset / exposure (HQ cmwv9c16) ──
+
+  static let maxUserId = 256
+  static let maxExposureText = 200
+  /// Device-side only, never sent: the user id an event was captured under, stamped by
+  /// `reset()` on what was still queued, so a sign-out never re-files the signed-out
+  /// user's last events under nobody (or under the next user). Absent = the current one.
+  static let asUserKey = "asUser"
+
+  /// A user id as the server takes it (alias.ts, identify.ts): trimmed, 1–256 chars, or nil.
+  static func cleanUserId(_ id: String) -> String? {
+    let t = id.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.isEmpty || t.utf16.count > maxUserId ? nil : t
+  }
+
+  /// Entries that are not analytics rows: no session activity, no super-properties, no groups, no `asUser` stamp.
+  static func isEntry(_ event: [String: Any]) -> Bool {
+    guard let kind = event["kind"] as? String else { return false }
+    return kind == "identify" || kind == "group" || kind == "alias"
+  }
+
+  /// The queue after `reset()` signed `userId` out: every queued analytics row not
+  /// stamped yet keeps `userId` as its user. Nothing to stamp without a user.
+  static func stampedForReset(_ queue: [[String: Any]], userId: String?) -> [[String: Any]] {
+    guard let userId = userId, !userId.isEmpty else { return queue }
+    return queue.map { e in
+      if isEntry(e) || e[asUserKey] != nil { return e }
+      var s = e
+      s[asUserKey] = userId
+      return s
+    }
+  }
+
+  /// The next batch to send: the leading events captured under ONE user id (their
+  /// `asUser` stamp, else `current`), at most `max`, and that user id — the batch's
+  /// `userId` on the wire. Entries (identify, group, alias) carry their own ids and ride
+  /// with any batch. The stamp is stripped from what travels.
+  static func nextBatch(_ queue: [[String: Any]], current: String?, max: Int) -> (events: [[String: Any]], userId: String?, taken: Int) {
+    var userId: String?
+    var fixed = false
+    var events: [[String: Any]] = []
+    for e in queue {
+      if events.count >= max { break }
+      if !isEntry(e) {
+        let stamp = e[asUserKey] as? String
+        let who = stamp != nil ? (stamp!.isEmpty ? nil : stamp) : current
+        if !fixed {
+          userId = who
+          fixed = true
+        } else if who != userId { break }
+      }
+      var wire = e
+      wire[asUserKey] = nil
+      events.append(wire)
+    }
+    return (events, fixed ? userId : current, events.count)
+  }
+
+  /// An alias entry: `previousId` and the current user are one person. Nil without a
+  /// current user, or when `previousId` is invalid or the current id itself.
+  /// Not activity: `sessionId` is the current session's or "".
+  static func aliasEntry(userId: String?, previousId: String, sessionId: String, now: Int64) -> [String: Any]? {
+    guard let userId = userId, !userId.isEmpty, let prev = cleanUserId(previousId), prev != userId else { return nil }
+    return ["kind": "alias", "ts": now, "sessionId": sessionId, "userId": userId, "previousId": prev]
+  }
+
+  /// `exposure(experiment, variant, props)`'s properties: `props` with `experiment` and
+  /// `variant` over them (the two named ones win), or nil when either is empty or over
+  /// 200 characters — what the console's experiment analysis reads. Props capture()
+  /// would drop are left out, so `experiment` and `variant` always travel.
+  static func exposureProps(experiment: String, variant: String, props: [String: Any]?) -> [String: Any]? {
+    let e = experiment.trimmingCharacters(in: .whitespacesAndNewlines)
+    let v = variant.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !e.isEmpty, !v.isEmpty, e.utf16.count <= maxExposureText, v.utf16.count <= maxExposureText else { return nil }
+    let named: [String: Any] = ["experiment": e, "variant": v]
+    // Props that capture() would drop (over 4 KB, not JSON) go alone: never an exposure without its experiment.
+    return cleanProps((props ?? [:]).merging(named) { _, mine in mine }) ?? named
+  }
+
   /// What a flush does with a batch after the server's answer.
   enum Outcome: Equatable { case sent, refused, retry }
 
@@ -251,6 +330,20 @@ struct TraqioAnalyticsState {
 
   /// Leaves every group (sign-out).
   mutating func resetGroups() {
+    groups = [:]
+  }
+
+  /// An alias entry for the current user, or nil (see `TraqioAnalyticsRules.aliasEntry`). Not activity.
+  func alias(userId: String?, previousId: String, now: Int64) -> [String: Any]? {
+    TraqioAnalyticsRules.aliasEntry(userId: userId, previousId: previousId, sessionId: session?.id ?? "", now: now)
+  }
+
+  /// Sign-out: no super-properties, no groups, no screen in view, and the session
+  /// ends — the next event opens a new one.
+  mutating func reset() {
+    session = nil
+    currentScreen = nil
+    superProps = [:]
     groups = [:]
   }
 

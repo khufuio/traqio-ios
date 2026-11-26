@@ -38,7 +38,7 @@ public enum Traqio {
   private static let superPropsKey = "traq_super_props"
   /// `group()`'s groups (B2B accounts), kept across launches beside the super-properties.
   private static let groupsKey = "traq_groups"
-  private static let sdkVersion = "0.2.0"
+  private static let sdkVersion = "0.3.0"
   private static let maxBatch = 20
   private static let maxQueue = 500
   private static let baseRetry: TimeInterval = 1
@@ -428,6 +428,60 @@ public enum Traqio {
     q.sync { loadAnalyticsState().groups }
   }
 
+  /// Two ids, one person: the user known so far as `previousId` (a guest id, an id
+  /// from before sign-up, an older system's) IS the current user (`setUserId` /
+  /// `identify`). Their analytics history and properties are merged under the current
+  /// id — the current id's own properties win. From an app, only what THIS device sent
+  /// under `previousId` is merged; a backend (secret key) merges everything.
+  ///
+  ///   Traqio.identify("u_123")
+  ///   Traqio.alias("guest_8f2c")
+  ///
+  /// Ignored without a current user id, or when `previousId` is the current one.
+  public static func alias(_ previousId: String) {
+    let now = nowMs()
+    q.async {
+      guard let e = loadAnalyticsState().alias(userId: userId, previousId: previousId, now: now) else { return }
+      queueAnalytics(e)
+    }
+  }
+
+  /// Sign-out: forget who the user was on this device — the user id (`track` too), the
+  /// super-properties (`register`), the groups (`group`), the screen in view — and end
+  /// the analytics session, so the next person's visit starts clean. Events already
+  /// queued keep the user they were captured under. The device id is KEPT: it is the
+  /// install's attribution identity, and a new one would read as a new install.
+  /// Consent and the conversion queue are kept too.
+  public static func reset() {
+    q.async {
+      // What is still queued was captured under the signed-out user: say so before forgetting it.
+      // Persisted with the stamps, so a relaunch keeps them too.
+      if userId != nil { saveAnalyticsQueue(TraqioAnalyticsRules.stampedForReset(loadAnalyticsQueue(), userId: userId)) }
+      userId = nil
+      var state = loadAnalyticsState()
+      state.reset()
+      // Set before `start` too: the lazy load then never restores an earlier launch's state.
+      analyticsState = state
+      let defaults = UserDefaults.standard
+      defaults.removeObject(forKey: superPropsKey)
+      defaults.removeObject(forKey: groupsKey)
+      defaults.removeObject(forKey: analyticsSessionKey)
+    }
+  }
+
+  /// An experiment exposure: the user SAW `variant` of `experiment` — what the console's
+  /// experiment analysis reads (uplift and significance per variant). Your app assigns
+  /// the variant (its own flags, a remote config, a hash); call this where the user
+  /// first meets it. Sends `$exposure` with `experiment`, `variant` and `properties`.
+  ///
+  ///   Traqio.exposure("paywall_copy", variant: "b")
+  ///
+  /// Both are trimmed text of 1–200 characters, else nothing is sent.
+  public static func exposure(_ experiment: String, variant: String, properties: [String: Any]? = nil) {
+    guard let p = TraqioAnalyticsRules.exposureProps(experiment: experiment, variant: variant, props: properties) else { return }
+    capture("$exposure", properties: p)
+  }
+
   // ── ad revenue (HQ cmwfo9pd) ───────────────────────────
 
   /// Report one AdMob impression by hand, from your own paid event handler. With
@@ -612,10 +666,11 @@ public enum Traqio {
   private static func flushAnalytics() {
     let items = loadAnalyticsQueue()
     if items.isEmpty { flushing = false; return }
-    let batch = Array(items.prefix(TraqioAnalyticsRules.maxBatch))
+    // One user per batch: events still queued at a reset() keep the user they were captured under.
+    let batch = TraqioAnalyticsRules.nextBatch(items, current: userId, max: TraqioAnalyticsRules.maxBatch)
     // `anonymousId` is the device id the install carries, so a visitor in the
     // Analytics page is a device in the attribution reports.
-    let body = TraqioAnalyticsRules.body(sdkKey: sdkKey, anonymousId: deviceId(), userId: userId, events: batch)
+    let body = TraqioAnalyticsRules.body(sdkKey: sdkKey, anonymousId: deviceId(), userId: batch.userId, events: batch.events)
     send(body, path: TraqioAnalyticsRules.path, consent: false) { status in
       q.async {
         let outcome = TraqioAnalyticsRules.outcome(status: status)
@@ -626,10 +681,10 @@ public enum Traqio {
           return
         }
         if outcome == .refused {
-          NSLog("[traqio] the server refused %d analytics event(s) as malformed — dropped, not retried", batch.count)
+          NSLog("[traqio] the server refused %d analytics event(s) as malformed — dropped, not retried", batch.taken)
         }
         var current = loadAnalyticsQueue()
-        current.removeFirst(min(batch.count, current.count))
+        current.removeFirst(min(batch.taken, current.count))
         saveAnalyticsQueue(current)
         retry = baseRetry
         flushAnalytics()
